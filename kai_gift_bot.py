@@ -1073,12 +1073,6 @@ def cb_stats(call):
     bot.send_message(call.message.chat.id, render_stats_text(), reply_markup=admin_main_menu_markup())
 
 
-# -------------------- GLOBAL ERROR HANDLING --------------------
-@bot.middleware_handler(update_types=["message", "callback_query"])
-def _guard(bot_instance, update):
-    pass
-
-
 def _global_exception_wrapper():
     while True:
         try:
