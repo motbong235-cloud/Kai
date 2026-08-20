@@ -1,5 +1,5 @@
 pyTelegramBotAPI
 Flask
-bakong-khqr
+bakong-khqr>=0.6.0
 qrcode
 Pillow
