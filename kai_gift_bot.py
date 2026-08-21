@@ -303,15 +303,22 @@ def _validate_custom_emoji_ids(ids):
 
 
 def filter_valid_entities(entities):
-    """ដក custom_emoji entity ដែល id ខូចចេញតែម្នាក់ឯង, ទុក id ត្រឹមត្រូវនៅដដែល"""
+    """ដក custom_emoji entity ដែល id ខូចចេញតែម្នាក់ឯង, ទុក id ត្រឹមត្រូវនៅដដែល។
+    Entity ប្រភេទដទៃទៀត (ឧ. bold ដែលប្រើក្នុងសារ DELIVERED) មិនមាន custom_emoji_id
+    ទេ ដូច្នេះត្រូវឲ្យវាឆ្លងកាត់ដោយផ្ទាល់ កុំយកទៅ validate ជាមួយ custom_emoji_id=None
+    (បើមិនដូច្នេះ វានឹងត្រូវដកចេញខុសដោយសារ None មិនផ្គូផ្គងនឹង str(None))។"""
     if not entities:
         return entities
-    ids = list({e.custom_emoji_id for e in entities})
+    emoji_entities = [e for e in entities if e.type == "custom_emoji" and e.custom_emoji_id]
+    other_entities = [e for e in entities if not (e.type == "custom_emoji" and e.custom_emoji_id)]
+    if not emoji_entities:
+        return entities
+    ids = list({e.custom_emoji_id for e in emoji_entities})
     valid_ids = _validate_custom_emoji_ids(ids)
-    kept = [e for e in entities if e.custom_emoji_id in valid_ids]
-    if len(kept) != len(entities):
-        log.info(f"filter_valid_entities: dropped {len(entities)-len(kept)} invalid custom_emoji entity(ies)")
-    return kept
+    kept = [e for e in emoji_entities if e.custom_emoji_id in valid_ids]
+    if len(kept) != len(emoji_entities):
+        log.info(f"filter_valid_entities: dropped {len(emoji_entities)-len(kept)} invalid custom_emoji entity(ies)")
+    return other_entities + kept
 
 
 def invalidate_emoji_cache(custom_emoji_id):
@@ -1057,11 +1064,19 @@ def cb_mark_delivered(call):
 
     bot.answer_callback_query(call.id, "✅ បានកត់ត្រាថាដាក់ Gift រួច")
     try:
-        bot.edit_message_text(
-            call.message.text + "\n\n✅ <b>DELIVERED</b>",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-        )
+        # ការពារ premium emoji ដើម (per-gift + global) កុំឲ្យបាត់ពេល edit —
+        # bot.edit_message_text ធម្មតាមិនស្គាល់ entities ចាស់ទេ លុះត្រាតែបញ្ជូនមកវិញ
+        # ដោយផ្ទាល់ (call.message.entities), បើមិនធ្វើបែបនេះ Premium emoji ក្នុងសារនេះ
+        # នឹងធ្លាក់ត្រឡប់ទៅ fallback unicode វិញភ្លាមៗពេលចុច "ដាក់ Gift រួច"។
+        orig_entities = list(call.message.entities or [])
+        suffix_prefix = "\n\n✅ "
+        bold_word = "DELIVERED"
+        new_text = call.message.text + suffix_prefix + bold_word
+        bold_offset = _emoji_len(call.message.text) + _emoji_len(suffix_prefix)
+        entities = orig_entities + [types.MessageEntity(
+            type="bold", offset=bold_offset, length=_emoji_len(bold_word),
+        )]
+        safe_edit_message_text(new_text, call.message.chat.id, call.message.message_id, entities=entities)
     except Exception:
         pass
     try:
@@ -1251,7 +1266,34 @@ def _global_emoji_capture_step(msg, glyph, label):
     )
 
 
-# ---------- ADD GIFT ----------
+# ---------- ADD GIFT (wizard: ឈ្មោះ -> តម្លៃ -> emoji, ម្តងមួយជំហាន) ----------
+# ចាស់: admin ត្រូវវាយបញ្ចូល "ឈ្មោះ | តម្លៃ | emoji" ក្នុងសារតែមួយ — បើវាយខុសទម្រង់ ឬ
+# ភ្លេច pipe មួយ ត្រូវចាប់ផ្តើមឡើងវិញទាំងអស់។ ថ្មី: សួរម្តងមួយជំហាន, validate រៀងខ្លួន
+# (បើខុស សួរឡើងវិញតែជំហាននោះ មិនបាត់ព័ត៌មានដែលបានវាយរួច), emoji អាចរំលងបានផងដែរ។
+def _cancel_markup():
+    m = types.InlineKeyboardMarkup()
+    m.add(build_button("❌ បោះបង់", "addgift_cancel", style="danger"))
+    return m
+
+
+def _clear_addgift_step(chat_id):
+    try:
+        bot.clear_step_handler_by_chat_id(chat_id)
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "addgift_cancel")
+def cb_addgift_cancel(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "អ្នកគ្មានសិទ្ធិ")
+        return
+    _clear_addgift_step(call.message.chat.id)
+    _addgift_drafts.pop(call.from_user.id, None)
+    bot.answer_callback_query(call.id, "បានបោះបង់")
+    bot.send_message(call.message.chat.id, "❌ បានបោះបង់ការបន្ថែម Gift", reply_markup=admin_main_menu_markup())
+
+
 @bot.callback_query_handler(func=lambda c: c.data == "adm:addgift")
 def cb_addgift(call):
     if not is_admin(call.from_user.id):
@@ -1260,56 +1302,117 @@ def cb_addgift(call):
     bot.answer_callback_query(call.id)
     msg = bot.send_message(
         call.message.chat.id,
-        "✍️ ផ្ញើតាមទម្រង់: <code>ឈ្មោះ | តម្លៃ | emoji</code>\n\n"
-        "ឧទាហរណ៍ (emoji ធម្មតា):\n<code>Cake | 2.5 | 🎂</code>\n\n"
-        "ឧទាហរណ៍ (Premium Emoji): គ្រាន់តែ <b>វាយ/ចម្លងបិទភ្ជាប់ Premium Emoji ផ្ទាល់</b> "
-        "ជំនួសកន្លែង emoji នោះ — Bot នឹងចាប់យក ID ដោយស្វ័យប្រវត្តិ:\n"
-        "<code>Cake | 2.5 | 🎂</code> ← (ដែល 🎂 ជា Premium Emoji ដែលអ្នកបិទភ្ជាប់)\n\n"
-        "💡 ត្រូវការគណនី Telegram Premium ដើម្បីផ្ញើ premium emoji។",
-        reply_markup=_back_button_markup(),
+        "➕ <b>បន្ថែម Gift ថ្មី</b> (1/3)\n\n✍️ តើ Gift នេះឈ្មោះអ្វី?\nឧទាហរណ៍: <code>Rose</code>",
+        reply_markup=_cancel_markup(),
     )
-    bot.register_next_step_handler(msg, _process_addgift)
+    bot.register_next_step_handler(msg, _addgift_step_name)
 
 
-def _process_addgift(msg):
+def _addgift_step_name(msg):
     if not is_admin(msg.from_user.id):
         return
-    try:
-        text = msg.text or ""
-        parts = [p.strip() for p in text.split("|")]
-        name = parts[0]
-        price = float(parts[1])
-        typed_emoji = parts[2] if len(parts) > 2 and parts[2] else "🎁"
-
-        # ព្យាយាមចាប់យក Premium Emoji ដោយស្វ័យប្រវត្តិពី entities នៃសារ
-        auto_fallback, auto_premium_id = extract_custom_emoji_from_message(msg)
-        emoji = auto_fallback if auto_fallback else typed_emoji
-        premium_emoji_id = auto_premium_id
-
-        gifts = load_gifts()
-        new_id = str(max([int(k) for k in gifts.keys()] + [0]) + 1)
-
-        emoji_warning = ""
-        if premium_emoji_id:
-            invalidate_emoji_cache(premium_emoji_id)
-            if premium_emoji_id not in _validate_custom_emoji_ids([premium_emoji_id]):
-                emoji_warning = "\n⚠️ Premium Emoji មិនត្រឹមត្រូវ — Gift នេះនឹងប្រើ fallback emoji ធម្មតា។"
-                premium_emoji_id = None
-
-        gifts[new_id] = {"name": name, "price": price, "emoji": emoji, "premium_emoji_id": premium_emoji_id}
-        save_gifts(gifts)
-
-        preview_text, preview_entities, _ = build_line_with_premium_emoji(emoji, name, premium_emoji_id)
-        prefix = f"✅ បានបន្ថែម Gift #{new_id}: "
-        safe_send_message(
-            msg.chat.id, f"{prefix}{preview_text} (${price}){emoji_warning}",
-            entities=[types.MessageEntity(type="custom_emoji", offset=_emoji_len(prefix),
-                                           length=e.length, custom_emoji_id=e.custom_emoji_id) for e in preview_entities],
-            reply_markup=admin_main_menu_markup(),
+    name = (msg.text or "").strip()
+    if not name:
+        m = bot.send_message(
+            msg.chat.id,
+            "❌ ឈ្មោះមិនអាចទទេបានទេ សូមវាយម្តងទៀត (1/3):",
+            reply_markup=_cancel_markup(),
         )
-    except Exception as e:
-        log.error(f"_process_addgift error: {e}")
-        bot.send_message(msg.chat.id, "❌ ទម្រង់មិនត្រឹមត្រូវ", reply_markup=admin_main_menu_markup())
+        bot.register_next_step_handler(m, _addgift_step_name)
+        return
+    m = bot.send_message(
+        msg.chat.id,
+        f"✅ ឈ្មោះ: {name}\n\n💵 <b>Gift ថ្មី</b> (2/3)\n\nតម្លៃប៉ុន្មាន? (ដុល្លារ)\nឧទាហរណ៍: <code>2.5</code>",
+        reply_markup=_cancel_markup(),
+    )
+    bot.register_next_step_handler(m, _addgift_step_price, {"name": name})
+
+
+# ដើម្បីឲ្យប៊ូតុង "ប្រើ Default" (callback_query) ដឹងពី name/price ដែលបានវាយរួច
+# (draft) — register_next_step_handler ដាក់ draft ជូនតែ message handler ប៉ុណ្ណោះ, មិន
+# ជូន callback_query handler ទេ ដូច្នេះត្រូវទុក draft ក្នុង dict បណ្តោះអាសន្ននេះ keyed
+# តាម admin user_id (សុវត្ថិភាព ព្រោះមានតែ admin ម្នាក់គត់អាចប្រើ flow នេះ)។
+_addgift_drafts = {}
+
+
+def _addgift_step_price(msg, draft):
+    if not is_admin(msg.from_user.id):
+        return
+    raw = (msg.text or "").strip().replace("$", "")
+    try:
+        price = float(raw)
+        if price <= 0:
+            raise ValueError("price must be positive")
+    except ValueError:
+        m = bot.send_message(
+            msg.chat.id,
+            f"❌ តម្លៃមិនត្រឹមត្រូវ (\"{raw}\") — សូមវាយជាលេខវិជ្ជមាន (ឧ. 2.5) (2/3):",
+            reply_markup=_cancel_markup(),
+        )
+        bot.register_next_step_handler(m, _addgift_step_price, draft)
+        return
+    draft["price"] = price
+    _addgift_drafts[msg.from_user.id] = draft
+    kb = types.InlineKeyboardMarkup()
+    kb.add(build_button("🎁 ប្រើ Default (🎁)", "addgift_default_emoji", style="primary"))
+    kb.add(build_button("❌ បោះបង់", "addgift_cancel", style="danger"))
+    m = bot.send_message(
+        msg.chat.id,
+        f"✅ តម្លៃ: ${price:.2f}\n\n😀 <b>Gift ថ្មី</b> (3/3)\n\n"
+        f"ផ្ញើ Emoji ធម្មតា (ឧ. 🎂) ឬ <b>Premium Emoji</b> ពិត (វាយ/ចម្លងបិទភ្ជាប់ផ្ទាល់) សម្រាប់ Gift នេះ — "
+        f"ឬចុច \"ប្រើ Default\" ខាងក្រោមដើម្បីរំលង:",
+        reply_markup=kb,
+    )
+    bot.register_next_step_handler(m, _addgift_step_emoji, draft)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "addgift_default_emoji")
+def cb_addgift_default_emoji(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "អ្នកគ្មានសិទ្ធិ")
+        return
+    _clear_addgift_step(call.message.chat.id)
+    draft = _addgift_drafts.pop(call.from_user.id, None)
+    if not draft or "name" not in draft or "price" not in draft:
+        bot.answer_callback_query(call.id, "សូមចាប់ផ្តើមម្តងទៀត")
+        bot.send_message(call.message.chat.id, "❌ Session ផុតកំណត់ សូម /admin ម្តងទៀត", reply_markup=admin_main_menu_markup())
+        return
+    bot.answer_callback_query(call.id)
+    _finalize_addgift(call.message.chat.id, draft["name"], draft["price"], "🎁", None)
+
+
+def _addgift_step_emoji(msg, draft):
+    if not is_admin(msg.from_user.id):
+        return
+    _addgift_drafts.pop(msg.from_user.id, None)
+    typed = (msg.text or "").strip()
+    auto_fallback, auto_premium_id = extract_custom_emoji_from_message(msg)
+    emoji = auto_fallback if auto_fallback else (typed or "🎁")
+    _finalize_addgift(msg.chat.id, draft["name"], draft["price"], emoji, auto_premium_id)
+
+
+def _finalize_addgift(chat_id, name, price, emoji, premium_emoji_id):
+    gifts = load_gifts()
+    new_id = str(max([int(k) for k in gifts.keys()] + [0]) + 1)
+
+    emoji_warning = ""
+    if premium_emoji_id:
+        invalidate_emoji_cache(premium_emoji_id)
+        if premium_emoji_id not in _validate_custom_emoji_ids([premium_emoji_id]):
+            emoji_warning = "\n⚠️ Premium Emoji មិនត្រឹមត្រូវ — Gift នេះនឹងប្រើ fallback emoji ធម្មតា។"
+            premium_emoji_id = None
+
+    gifts[new_id] = {"name": name, "price": price, "emoji": emoji, "premium_emoji_id": premium_emoji_id}
+    save_gifts(gifts)
+
+    preview_text, preview_entities, _ = build_line_with_premium_emoji(emoji, name, premium_emoji_id)
+    prefix = f"✅ បានបន្ថែម Gift #{new_id}: "
+    safe_send_message(
+        chat_id, f"{prefix}{preview_text} (${price:.2f}){emoji_warning}",
+        entities=[types.MessageEntity(type="custom_emoji", offset=_emoji_len(prefix),
+                                       length=e.length, custom_emoji_id=e.custom_emoji_id) for e in preview_entities],
+        reply_markup=admin_main_menu_markup(),
+    )
 
 
 # ---------- LIST GIFTS ----------
