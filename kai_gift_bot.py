@@ -319,7 +319,12 @@ def invalidate_emoji_cache(custom_emoji_id):
 
 
 def safe_send_message(chat_id, text, entities=None, reply_markup=None, **kwargs):
-    """ផ្ញើសារជាមួយ premium emoji entities, ដក id ខូចចេញតែម្នាក់ឯង, fallback ពេញលេញបើនៅតែបរាជ័យ"""
+    """ផ្ញើសារជាមួយ premium emoji entities, ដក id ខូចចេញតែម្នាក់ឯង, fallback ពេញលេញបើនៅតែបរាជ័យ។
+    ត្រង់នេះក៏បន្ថែម global premium emoji (ដាក់តាម /setupemoji) ទៅ glyph ដទៃទៀតក្នុង text ដែរ
+    (ឧ. 🆕 👤 👉 ក្នុងសារជូនដំណឹង order) — បើគ្មាន add_global_emoji_entities() ទេ glyph ទាំងនោះ
+    នឹងមិនដាក់ Premium ទេ ព្រោះការហៅ bot.send_message ជាមួយ entities= ធ្វើឲ្យ monkey-patch
+    global premium_text() (ដែលធម្មតាដោះស្រាយ glyph ទាំងនេះ) skip ខ្លួនវាឯង។"""
+    entities = add_global_emoji_entities(text, entities)
     entities = filter_valid_entities(entities)
     try:
         if entities:
@@ -336,6 +341,7 @@ def safe_send_message(chat_id, text, entities=None, reply_markup=None, **kwargs)
 
 
 def safe_edit_message_text(text, chat_id, message_id, entities=None, reply_markup=None, **kwargs):
+    entities = add_global_emoji_entities(text, entities)
     entities = filter_valid_entities(entities)
     try:
         if entities:
@@ -455,6 +461,54 @@ def premium_text(text):
     for token, tag_html in placeholders.items():
         text = text.replace(token, tag_html)
     return text
+
+
+def _find_glyph_offsets(text, glyph):
+    """រកទីតាំង (utf16_offset, utf16_length) គ្រប់ occurrence នៃ glyph ក្នុង text។"""
+    offsets = []
+    start = 0
+    glyph_len = _emoji_len(glyph)
+    while True:
+        idx = text.find(glyph, start)
+        if idx == -1:
+            break
+        offset = _emoji_len(text[:idx])
+        offsets.append((offset, glyph_len))
+        start = idx + len(glyph)
+    return offsets
+
+
+def _ranges_overlap(a_off, a_len, b_off, b_len):
+    return a_off < b_off + b_len and b_off < a_off + a_len
+
+
+def add_global_emoji_entities(text, entities=None):
+    """បន្ថែម custom_emoji entities សម្រាប់ glyph ណាមួយក្នុង global emoji map ដែលមាននៅ
+    ក្នុង text — ដោយមិនជាន់ (overlap) លើ entity ដែលមានស្រាប់ (ឧ. per-gift premium emoji)។
+
+    មូលហេតុត្រូវការមុខងារនេះ: បើសារណាមួយផ្ញើដោយ entities= ផ្ទាល់ខ្លួន (ឧ. per-gift
+    emoji ក្នុង catalog/order message), _should_skip_global_emoji() នៅក្នុង monkey-patch
+    bot.send_message នឹង skip premium_text() ទាំងអស់ — ធ្វើឲ្យ glyph សកលដទៃទៀតក្នុងសារ
+    ដដែល (ឧ. 🆕 👤 👉 ដែល admin បានដាក់ Premium តាម /setupemoji) មិនដាក់ Premium ទេ សូម្បី
+    តែបានកំណត់រួចក៏ដោយ — នេះជាមូលហេតុ 'កន្លែងខ្លះដាក់ emoji អត់ជាប់'។ ត្រង់នេះបំពេញចន្លោះ
+    នោះដោយបន្ថែម entity ដោយផ្ទាល់សម្រាប់ glyph ទាំងនោះ ជំនួសឲ្យពឹងផ្អែក premium_text()។"""
+    entities = list(entities) if entities else []
+    m = get_emoji_map()
+    if not m or not text:
+        return entities
+    existing_ranges = [(e.offset, e.length) for e in entities]
+    for glyph, info in sorted(m.items(), key=lambda kv: len(kv[0]), reverse=True):
+        icon_id = info.get("custom_emoji_id")
+        if not icon_id or not glyph or glyph not in text:
+            continue
+        for offset, length in _find_glyph_offsets(text, glyph):
+            if any(_ranges_overlap(offset, length, ro, rl) for ro, rl in existing_ranges):
+                continue
+            entities.append(types.MessageEntity(
+                type="custom_emoji", offset=offset, length=length, custom_emoji_id=str(icon_id),
+            ))
+            existing_ranges.append((offset, length))
+    return entities
 
 
 def _is_entity_parse_error(exc):
