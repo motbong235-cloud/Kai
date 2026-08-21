@@ -1,5 +1,5 @@
-pyTelegramBotAPI
-Flask
-bakong-khqr>=0.6.0
-qrcode
-Pillow
+pyTelegramBotAPI==4.23.0
+requests==2.32.3
+Flask==3.0.3
+qrcode==7.4.2
+Pillow==10.4.0
