@@ -15,22 +15,20 @@ ENV VARS ត្រូវការ:
   BOT_TOKEN            - Telegram bot token
   ADMIN_ID             - Telegram user id របស់ admin (default 8266854899)
   CAMRAPIDPAY_API_KEY  - API Key ពី portal.camrapidpay.com
-  CAMRAPIDPAY_SECRET   - Secret Key ពី portal.camrapidpay.com
-  BAKONG_ACCOUNT_ID    - គណនី Bakong (KHQR receiver, ex: your_account@wing)
-  MERCHANT_NAME        - ឈ្មោះហាង បង្ហាញលើ QR
+  MERCHANT_NAME        - ឈ្មោះហាង បង្ហាញលើសារ QR (មិនចាំបាច់ផ្ញើទៅ API ទេ)
   RENDER_EXTERNAL_URL  - (auto-set ដោយ Render) ប្រើសង់ webhook_url ជូន CamRapidPay
   DATA_DIR             - path ទុក JSON (default ./data) — ដាក់ /var/data លើ Render disk
 
-⚠️ សំខាន់អំពី CamRapidPay Auto-Payment:
-  - ប្រើ CamRapidPay REST API (https://api.camrapidpay.com) ជំនួស Bakong Open API ផ្ទាល់
-    ព្រោះ CamRapidPay ជា relay ស្ថិតនៅកម្ពុជា — មិនជួប 403 geo-block ដូច server នៅក្រៅ
-    ប្រទេសទាក់ទង Bakong ដោយផ្ទាល់ទេ
-  - endpoint create-payments ទាមទារ webhook_url ជា mandatory field (រកឃើញកាលពីមុន
-    ក្នុងគម្រោង Kaijaklike) — យើងសង់ពី RENDER_EXTERNAL_URL ស្វ័យប្រវត្តិ
-  - ⚠️ FIELD NAMES ខាងក្រោមជា ការស្មាន (best-effort) ពី REST convention ទូទៅ ព្រោះ
-    docs.camrapidpay.com ត្រូវ login ទើបឃើញ schema ពេញលេញ។ សូមផ្ទៀងផ្ទាត់ជាមួយ
-    portal.camrapidpay.com/docs (ប្រើ API Key ផ្ទាល់ខ្លួន) មុនដាក់ live ពិតប្រាកដ —
-    ប្រើ /testpay (admin command) ដើម្បីសាកល្បង $0.01 មុនចាប់ផ្តើមលក់ពិត
+💳 CamRapidPay KHQR (schema ដែលបានផ្ទៀងផ្ទាត់ត្រឹមត្រូវរួច — ដូចគម្រោង Kairozen ដទៃទៀត):
+  - Create: POST https://pay.camrapidpay.com/api/v1/khqr/create-payments
+      body: {api_key, amount, reference, webhook_url}  → response: {success, qr_code, payment_url}
+  - Check:  GET  https://pay.camrapidpay.com/check-transaction-api
+      params: {api_key, reference}  → response: {success, status: "success"|"paid"}
+  - `reference` គឺជា order_id ខ្លួនឯង (uuid.hex[:10]) ដែលបានផ្ញើពេល create — ប្រើវាឡើងវិញ
+    ដើម្បី check status ដោយមិនចាំបាច់ payment_id ដាច់ដោយឡែក
+  - webhook_url ជា mandatory field ត្រូវសង់ពី RENDER_EXTERNAL_URL ស្វ័យប្រវត្តិ (Flask route
+    /camrapid-webhook ទទួល push ពី CamRapidPay ដោយ log ចោលតែប៉ុណ្ណោះ — bot ប្រើ polling
+    (check_khqr_status) ជាចម្បងសម្រាប់ detect ការទូទាត់)
   - Bot ធ្វើ health-check ស្វ័យប្រវត្តិពេលចាប់ផ្តើម ជូនដំណឹង Admin ភ្លាមៗបើ Key/connectivity មានបញ្ហា
   - Poll រៀងរាល់ 5 វិនាទី រហូតដល់ 10 នាទី (timeout)
 
@@ -46,7 +44,6 @@ import uuid
 import logging
 import threading
 import hashlib
-import hmac
 from datetime import datetime
 from decimal import Decimal
 
@@ -58,9 +55,12 @@ from telebot import types
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8266854899"))
 CAMRAPIDPAY_API_KEY = os.environ.get("CAMRAPIDPAY_API_KEY", "")
-CAMRAPIDPAY_SECRET = os.environ.get("CAMRAPIDPAY_SECRET", "")
-CAMRAPIDPAY_BASE_URL = os.environ.get("CAMRAPIDPAY_BASE_URL", "https://api.camrapidpay.com")
-BAKONG_ACCOUNT_ID = os.environ.get("BAKONG_ACCOUNT_ID", "")
+CAMRAPID_CREATE_URL = os.environ.get(
+    "CAMRAPID_CREATE_URL", "https://pay.camrapidpay.com/api/v1/khqr/create-payments"
+)
+CAMRAPID_CHECK_URL = os.environ.get(
+    "CAMRAPID_CHECK_URL", "https://pay.camrapidpay.com/check-transaction-api"
+)
 MERCHANT_NAME = os.environ.get("MERCHANT_NAME", "Kai Gift Shop")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
@@ -315,33 +315,25 @@ def is_admin(uid):
 
 
 # -------------------- KHQR (CamRapidPay) --------------------
-# ប្រើ CamRapidPay REST API (https://api.camrapidpay.com) ជំនួស Bakong Open API ផ្ទាល់។
-# ⚠️ Field names ខាងក្រោមជា ការស្មានល្អបំផុត (best-effort) ពី REST convention ទូទៅ —
-# សូមផ្ទៀងផ្ទាត់ជាមួយ portal.camrapidpay.com/docs (login ជាមួយ API Key ផ្ទាល់ខ្លួន)
-# រួច​ប្រើ admin command /testpay ដើម្បីសាកល្បង $0.01 មុនចាប់ផ្តើមលក់ពិត។ បើ field
-# ណាមួយខុស សូម copy error message មកឲ្យខ្ញុំកែតាម response ពិត។
+# schema ដែលបានផ្ទៀងផ្ទាត់ត្រឹមត្រូវរួច (ដូចគម្រោង Kairozen ដទៃទៀតទាំងអស់)៖
+#   POST {CAMRAPID_CREATE_URL}  body: {api_key, amount, reference, webhook_url}
+#        → {success, qr_code, payment_url}
+#   GET  {CAMRAPID_CHECK_URL}   params: {api_key, reference}
+#        → {success, status: "success" | "paid"}
 _camrapidpay_warned = False  # ជៀសវាងផ្ញើសារព្រមានដដែលៗច្រើនដង
-
-
-def _camrapidpay_header_variants():
-    """ព្យាយាមទម្រង់ header ស្តង់ដារជាច្រើន ព្រោះមិនដឹងច្បាស់ថា API ត្រូវការទម្រង់ណា"""
-    base = {"Content-Type": "application/json"}
-    return [
-        {**base, "X-API-Key": CAMRAPIDPAY_API_KEY, "X-Secret-Key": CAMRAPIDPAY_SECRET},
-        {**base, "api-key": CAMRAPIDPAY_API_KEY, "secret-key": CAMRAPIDPAY_SECRET},
-        {**base, "Authorization": f"Bearer {CAMRAPIDPAY_API_KEY}"},
-        {**base, "Authorization": f"Bearer {CAMRAPIDPAY_API_KEY}:{CAMRAPIDPAY_SECRET}"},
-    ]
+_last_camrapid_error = ""    # debug: error ចុងក្រោយ — មើលបានតាម /testpay
 
 
 def _webhook_url():
+    """CamRapidPay តម្រូវ webhook_url ជា mandatory field ពេល create — ត្រូវជា URL
+    សាធារណៈពិតប្រាកដ (Render ដាក់ RENDER_EXTERNAL_URL ស្វ័យប្រវត្តិ)។"""
     if not RENDER_EXTERNAL_URL:
-        return "https://example.invalid/webhook/camrapidpay"  # placeholder — QR នៅតែបង្កើតបាន តែ webhook មិនចូលទេ
-    return f"{RENDER_EXTERNAL_URL}/webhook/camrapidpay"
+        return ""
+    return f"{RENDER_EXTERNAL_URL}/camrapid-webhook"
 
 
 def _notify_admin_camrapidpay_issue(reason: str):
-    """ជូនដំណឹង admin តែម្តងគត់ក្នុងមួយ run លើបញ្ហា CamRapidPay (auth/schema/connectivity)"""
+    """ជូនដំណឹង admin តែម្តងគត់ក្នុងមួយ run លើបញ្ហា CamRapidPay (auth/connectivity)"""
     global _camrapidpay_warned
     if _camrapidpay_warned:
         return
@@ -350,85 +342,97 @@ def _notify_admin_camrapidpay_issue(reason: str):
         bot.send_message(
             ADMIN_ID,
             f"⚠️ <b>CamRapidPay មានបញ្ហា</b>\n\n{reason}\n\n"
-            f"💡 សូមប្រើ /testpay ដើម្បីមើល error លម្អិត រួច copy ជូន developer កែ។",
+            f"💡 សូមប្រើ /testpay ដើម្បីមើល error លម្អិត។",
         )
     except Exception:
         pass
 
 
-# Endpoint path candidates — ព្យាយាមតាមលំដាប់ រហូតជួប status 2xx
-_CREATE_PATHS = ["/api/v1/create-payments", "/api/v1/create-payment", "/api/create-payment"]
-_CHECK_PATHS = ["/api/v1/check-payment/{id}", "/api/v1/check-transaction/{id}", "/api/check-payment/{id}"]
-
-
 def create_khqr(amount_usd, order_id):
-    """
-    ព្យាយាមហៅ CamRapidPay តាម endpoint path + header variant ជាច្រើន រហូតជោគជ័យ។
-    ត្រឡប់ dict: {"qr_string":..., "md5":..., "created_at": float} ឬ None បើគ្រប់ variant បរាជ័យ។
-    """
-    payload = {
-        "amount": float(amount_usd),
-        "currency": "USD",
-        "bakong_account_id": BAKONG_ACCOUNT_ID,
-        "account_id": BAKONG_ACCOUNT_ID,  # alias — ខ្លះ API ប្រើឈ្មោះនេះ
-        "merchant_name": MERCHANT_NAME,
-        "merchant_city": "Phnom Penh",
-        "bill_number": order_id,
-        "order_id": order_id,  # alias
-        "store_label": "KaiGift",
-        "terminal_label": "KaiGiftBot",
-        "webhook_url": _webhook_url(),  # mandatory field (រកឃើញកាលពីមុនក្នុងគម្រោង Kaijaklike)
-        "api_key": CAMRAPIDPAY_API_KEY,   # ខ្លះទាមទារក្នុង body ជំនួស/បន្ថែមពី header
-        "secret_key": CAMRAPIDPAY_SECRET,
-    }
-    attempts_log = []
-    for path in _CREATE_PATHS:
-        for headers in _camrapidpay_header_variants():
-            try:
-                resp = requests.post(
-                    f"{CAMRAPIDPAY_BASE_URL}{path}", headers=headers, json=payload, timeout=15
-                )
-                if resp.status_code >= 400:
-                    attempts_log.append(f"{path} [{list(headers.keys())[1]}] -> HTTP {resp.status_code}: {resp.text[:150]}")
-                    continue
-                data = resp.json()
-                body = data.get("data", data)
-                qr_string = body.get("qr_string") or body.get("qr") or body.get("khqr_string") or body.get("qr_code")
-                payment_id = body.get("md5") or body.get("transaction_id") or body.get("payment_id") or body.get("id")
-                if qr_string and payment_id:
-                    log.info(f"CamRapidPay create OK via {path}")
-                    return {"qr_string": qr_string, "md5": payment_id, "created_at": time.time()}
-                attempts_log.append(f"{path} -> 2xx but missing qr/md5 field. Raw: {data}")
-            except Exception as e:
-                attempts_log.append(f"{path} -> exception: {e}")
-    # គ្រប់ variant បរាជ័យ
-    detail = "\n".join(attempts_log[:6])
-    log.error(f"CamRapidPay create-payments ALL attempts failed:\n{detail}")
-    _notify_admin_camrapidpay_issue(f"បរាជ័យបង្កើត QR (គ្រប់ endpoint/header variant):\n{detail}")
-    return None
+    """បង្កើត KHQR តាម CamRapidPay។ ត្រឡប់ dict {"qr_string", "payment_url", "md5",
+    "created_at"} ឬ None បើបរាជ័យ។ `md5` ត្រង់នេះស្មើ order_id ខ្លួនឯង (=reference
+    ដែលបានផ្ញើពេល create) ព្រោះ CamRapidPay មិន return payment id ដាច់ដោយឡែកទេ —
+    ត្រូវប្រើ reference ដដែលនេះឡើងវិញពេល check_khqr_status()។"""
+    global _last_camrapid_error
+    if not CAMRAPIDPAY_API_KEY:
+        _last_camrapid_error = "CAMRAPIDPAY_API_KEY មិនបានកំណត់ក្នុង environment variables"
+        log.error(f"[create_khqr] {_last_camrapid_error}")
+        _notify_admin_camrapidpay_issue(_last_camrapid_error)
+        return None
+    webhook_url = _webhook_url()
+    if not webhook_url:
+        _last_camrapid_error = "RENDER_EXTERNAL_URL មិនទាន់កំណត់ — CamRapidPay តម្រូវ webhook_url"
+        log.error(f"[create_khqr] {_last_camrapid_error}")
+        _notify_admin_camrapidpay_issue(_last_camrapid_error)
+        return None
+    try:
+        resp = requests.post(
+            CAMRAPID_CREATE_URL,
+            json={
+                "api_key": CAMRAPIDPAY_API_KEY,
+                "amount": round(float(amount_usd), 2),
+                "reference": order_id,
+                "webhook_url": webhook_url,
+            },
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=20,
+        )
+        try:
+            data = resp.json()
+        except Exception:
+            _last_camrapid_error = f"HTTP {resp.status_code} (non-JSON): {resp.text[:300]}"
+            log.error(f"[create_khqr] {_last_camrapid_error}")
+            _notify_admin_camrapidpay_issue(_last_camrapid_error)
+            return None
+        if not data.get("success"):
+            _last_camrapid_error = f"HTTP {resp.status_code}: {data}"
+            log.error(f"[create_khqr] failed: {_last_camrapid_error}")
+            _notify_admin_camrapidpay_issue(_last_camrapid_error)
+            return None
+        qr_string = data.get("qr_code", "")
+        payment_url = data.get("payment_url", "")
+        if not qr_string:
+            _last_camrapid_error = f"2xx ប៉ុន្តែគ្មាន qr_code: {data}"
+            log.error(f"[create_khqr] {_last_camrapid_error}")
+            _notify_admin_camrapidpay_issue(_last_camrapid_error)
+            return None
+        log.info(f"[create_khqr] OK reference={order_id}")
+        return {
+            "qr_string": qr_string,
+            "payment_url": payment_url,
+            "md5": order_id,
+            "created_at": time.time(),
+        }
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        _last_camrapid_error = f"{type(e).__name__}: {e}"
+        log.error(f"[create_khqr] transient error: {_last_camrapid_error}")
+        _notify_admin_camrapidpay_issue(_last_camrapid_error)
+        return None
+    except Exception as e:
+        _last_camrapid_error = f"{type(e).__name__}: {e}"
+        log.error(f"[create_khqr] error: {_last_camrapid_error}")
+        _notify_admin_camrapidpay_issue(_last_camrapid_error)
+        return None
 
 
 def check_khqr_status(payment_id):
-    """ព្យាយាមហៅ CamRapidPay check endpoint តាម path variant ជាច្រើន។ ត្រឡប់ (is_paid, next_delay)"""
-    attempts_log = []
-    for path_tpl in _CHECK_PATHS:
-        path = path_tpl.format(id=payment_id)
-        for headers in _camrapidpay_header_variants():
-            try:
-                resp = requests.get(f"{CAMRAPIDPAY_BASE_URL}{path}", headers=headers, timeout=15)
-                if resp.status_code >= 400:
-                    attempts_log.append(f"{path} -> HTTP {resp.status_code}: {resp.text[:150]}")
-                    continue
-                data = resp.json()
-                body = data.get("data", data)
-                status = str(body.get("status", "")).upper()
-                return status == "PAID", 5
-            except Exception as e:
-                attempts_log.append(f"{path} -> exception: {e}")
-    detail = "\n".join(attempts_log[:6])
-    log.error(f"CamRapidPay check ALL attempts failed:\n{detail}")
-    _notify_admin_camrapidpay_issue(f"បរាជ័យ check payment (គ្រប់ endpoint/header variant):\n{detail}")
-    return False, 5
+    """payment_id ត្រង់នេះជា reference (=order_id) ដែលបានផ្ញើពេល create_khqr()។
+    ត្រឡប់ (is_paid, next_delay_sec)។"""
+    global _last_camrapid_error
+    try:
+        resp = requests.get(
+            CAMRAPID_CHECK_URL,
+            params={"api_key": CAMRAPIDPAY_API_KEY, "reference": payment_id},
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        data = resp.json()
+        is_paid = bool(data.get("success")) and str(data.get("status", "")).lower() in ("success", "paid")
+        return is_paid, 5
+    except Exception as e:
+        _last_camrapid_error = f"{type(e).__name__}: {e}"
+        log.error(f"[check_khqr_status] error: {_last_camrapid_error}")
+        return False, 5
 
 
 def poll_payment(order_id, payment_id, timeout_sec=600, created_at=None):
@@ -658,6 +662,10 @@ def cb_confirm_order(call):
     user_state.pop(uid, None)
 
     bot.answer_callback_query(call.id)
+    kb = None
+    if qr_data.get("payment_url"):
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔗 បើកទំព័រទូទាត់", url=qr_data["payment_url"]))
     try:
         import qrcode
         from io import BytesIO
@@ -668,13 +676,16 @@ def cb_confirm_order(call):
         bot.send_photo(
             call.message.chat.id, buf,
             caption=f"💳 សូមស្កេន QR ដើម្បីទូទាត់ ${price}\n"
+                    f"🏪 {MERCHANT_NAME}\n"
                     f"🆔 Order: <code>{order_id}</code>\n\n"
                     f"⏳ QR នេះមានសុពលភាព 10 នាទី",
+            reply_markup=kb,
         )
     except Exception:
         bot.send_message(
             call.message.chat.id,
             f"💳 KHQR String:\n<code>{qr_data['qr_string']}</code>\n\nOrder: {order_id}",
+            reply_markup=kb,
         )
 
     t = threading.Thread(
@@ -1139,7 +1150,8 @@ def cmd_testpay(msg):
     bot.send_message(
         msg.chat.id,
         f"✅ បង្កើត QR ជោគជ័យ!\n\n"
-        f"🆔 payment_id: <code>{qr_data['md5']}</code>\n\n"
+        f"🆔 reference: <code>{qr_data['md5']}</code>\n"
+        f"🔗 payment_url: {qr_data.get('payment_url') or '(គ្មាន)'}\n\n"
         f"💳 QR String:\n<code>{qr_data['qr_string']}</code>\n\n"
         f"សូមស្កេន QR នេះទូទាត់ $0.01 ដើម្បីសាកល្បង auto-detect (រង់ចាំ ~10-15 វិនាទីរួច /checkpay)",
     )
@@ -1185,22 +1197,32 @@ def _startup_camrapidpay_healthcheck():
                 ADMIN_ID,
                 f"🔴 <b>CamRapidPay Health-Check បរាជ័យ</b> ពេល bot ចាប់ផ្តើម!\n\n{err}\n\n"
                 f"KHQR payment នឹងមិនដំណើរការទេ រហូតដល់កែបញ្ហានេះ។ "
-                f"សូមពិនិត្យ CAMRAPIDPAY_API_KEY/CAMRAPIDPAY_SECRET និង field names ជាមួយ "
-                f"portal.camrapidpay.com/docs។",
+                f"សូមពិនិត្យ CAMRAPIDPAY_API_KEY និង RENDER_EXTERNAL_URL។",
             )
         except Exception:
             pass
 
 
 if __name__ == "__main__":
-    # Flask keep-alive for Render Web Service (optional if using Background Worker)
+    # Flask keep-alive + webhook endpoint សម្រាប់ Render Web Service
     try:
-        from flask import Flask
+        from flask import Flask, request as flask_request
         app = Flask(__name__)
 
         @app.route("/")
         def home():
             return "Kai Gift Bot is running"
+
+        @app.route("/camrapid-webhook", methods=["POST", "GET"])
+        def camrapid_webhook():
+            # CamRapidPay ហៅ endpoint នេះពេលទូទាត់ជោគជ័យ។ bot ប្រើ polling
+            # (check_khqr_status) ជាចម្បងរួចហើយ ដូច្នេះទីនេះគ្រាន់តែ log ចោល និង
+            # return 200 ដើម្បីបំពេញលក្ខខណ្ឌ webhook_url ដែល CamRapidPay តម្រូវ។
+            try:
+                log.info(f"[camrapid_webhook] {flask_request.get_json(silent=True) or flask_request.args}")
+            except Exception:
+                pass
+            return {"success": True}, 200
 
         threading.Thread(
             target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080))),
