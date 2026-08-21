@@ -12,24 +12,30 @@ Kai Gift Bot — លក់ Gift ដោយ Admin ដាក់ដោយដៃ
      ដើម្បីបិទ order។ គ្មានការ deliver ស្វ័យប្រវត្តិឡើយ។
 
 ENV VARS ត្រូវការ:
-  BOT_TOKEN        - Telegram bot token
-  ADMIN_ID         - Telegram user id របស់ admin (default 8266854899)
-  BAKONG_TOKEN     - Bakong Developer Token (ចុះឈ្មោះ https://api-bakong.nbc.gov.kh/register/)
-                     ឬ RBK Relay Token (https://bakongrelay.com) បើ server នៅក្រៅកម្ពុជា
-  BAKONG_ACCOUNT_ID- គណនី Bakong (KHQR receiver, ex: your_account@wing)
-  MERCHANT_NAME    - ឈ្មោះហាង បង្ហាញលើ QR
-  DATA_DIR         - path ទុក JSON (default ./data) — ដាក់ /var/data លើ Render disk
+  BOT_TOKEN            - Telegram bot token
+  ADMIN_ID             - Telegram user id របស់ admin (default 8266854899)
+  CAMRAPIDPAY_API_KEY  - API Key ពី portal.camrapidpay.com
+  CAMRAPIDPAY_SECRET   - Secret Key ពី portal.camrapidpay.com
+  BAKONG_ACCOUNT_ID    - គណនី Bakong (KHQR receiver, ex: your_account@wing)
+  MERCHANT_NAME        - ឈ្មោះហាង បង្ហាញលើ QR
+  RENDER_EXTERNAL_URL  - (auto-set ដោយ Render) ប្រើសង់ webhook_url ជូន CamRapidPay
+  DATA_DIR             - path ទុក JSON (default ./data) — ដាក់ /var/data លើ Render disk
 
-⚠️ សំខាន់អំពី Bakong Auto-Payment:
-  - Bakong Open API check-by-md5 ដំណើរការតែលើ Dynamic KHQR ប៉ុណ្ណោះ (static=False)
-  - Server ក្រៅកម្ពុជា (ដូចជា Render) ជាញឹកញាប់ជួប HTTP 403 ព្រោះ Bakong Open API
-    កំណត់ geo/IP — ដំណោះស្រាយ: ប្រើ RBK Relay Token ជំនួស Bakong Token ធម្មតា
-    (bakong-khqr SDK v0.5+ support ដោយផ្ទាល់, គ្មានកូដផ្លាស់ប្តូរ)
-  - Bot ធ្វើ health-check ស្វ័យប្រវត្តិពេលចាប់ផ្តើម ជូនដំណឹង Admin ភ្លាមៗបើ Token/connectivity មានបញ្ហា
-  - ប្រើ Smart Polling matrix (bakong-khqr v0.6.0+): 5s→10s→15s→300s តាមពេលកន្លងទៅ
-    ដើម្បីសន្សំ API quota
+⚠️ សំខាន់អំពី CamRapidPay Auto-Payment:
+  - ប្រើ CamRapidPay REST API (https://api.camrapidpay.com) ជំនួស Bakong Open API ផ្ទាល់
+    ព្រោះ CamRapidPay ជា relay ស្ថិតនៅកម្ពុជា — មិនជួប 403 geo-block ដូច server នៅក្រៅ
+    ប្រទេសទាក់ទង Bakong ដោយផ្ទាល់ទេ
+  - endpoint create-payments ទាមទារ webhook_url ជា mandatory field (រកឃើញកាលពីមុន
+    ក្នុងគម្រោង Kaijaklike) — យើងសង់ពី RENDER_EXTERNAL_URL ស្វ័យប្រវត្តិ
+  - ⚠️ FIELD NAMES ខាងក្រោមជា ការស្មាន (best-effort) ពី REST convention ទូទៅ ព្រោះ
+    docs.camrapidpay.com ត្រូវ login ទើបឃើញ schema ពេញលេញ។ សូមផ្ទៀងផ្ទាត់ជាមួយ
+    portal.camrapidpay.com/docs (ប្រើ API Key ផ្ទាល់ខ្លួន) មុនដាក់ live ពិតប្រាកដ —
+    ប្រើ /testpay (admin command) ដើម្បីសាកល្បង $0.01 មុនចាប់ផ្តើមលក់ពិត
+  - Bot ធ្វើ health-check ស្វ័យប្រវត្តិពេលចាប់ផ្តើម ជូនដំណឹង Admin ភ្លាមៗបើ Key/connectivity មានបញ្ហា
+  - Poll រៀងរាល់ 5 វិនាទី រហូតដល់ 10 នាទី (timeout)
 
-Deploy: Render Background Worker (គ្មាន public port ក៏បាន ព្រោះ polling)
+Deploy: Render Web Service (ត្រូវការ public URL សម្រាប់ webhook_url — មិនអាចជា
+Background Worker សុទ្ធទេ ព្រោះ CamRapidPay push webhook មកវិញ)
 Persistence: JSON files ក្នុង DATA_DIR (gifts.json, orders.json)
 """
 
@@ -39,18 +45,24 @@ import time
 import uuid
 import logging
 import threading
+import hashlib
+import hmac
 from datetime import datetime
 from decimal import Decimal
 
+import requests
 import telebot
 from telebot import types
 
 # -------------------- CONFIG --------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8266854899"))
-BAKONG_TOKEN = os.environ.get("BAKONG_TOKEN", "")
+CAMRAPIDPAY_API_KEY = os.environ.get("CAMRAPIDPAY_API_KEY", "")
+CAMRAPIDPAY_SECRET = os.environ.get("CAMRAPIDPAY_SECRET", "")
+CAMRAPIDPAY_BASE_URL = os.environ.get("CAMRAPIDPAY_BASE_URL", "https://api.camrapidpay.com")
 BAKONG_ACCOUNT_ID = os.environ.get("BAKONG_ACCOUNT_ID", "")
 MERCHANT_NAME = os.environ.get("MERCHANT_NAME", "Kai Gift Shop")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -302,103 +314,132 @@ def is_admin(uid):
     return uid == ADMIN_ID
 
 
-# -------------------- KHQR (Bakong) --------------------
-# សំខាន់ៗដែលរកឃើញពី Bakong Open API ផ្លូវការ + bakong-khqr SDK (v0.6.0+):
-#   1) ត្រូវការ Bakong Developer Token ចុះឈ្មោះនៅ https://api-bakong.nbc.gov.kh/register/
-#      (production) ឬ SIT sandbox សម្រាប់សាកល្បង។ Token ត្រូវ renew តាមកាលកំណត់។
-#   2) Server ដែល host bot (ឧ. Render) ជាញឹកញាប់ស្ថិតនៅក្រៅប្រទេសកម្ពុជា ដែល
-#      Bakong Open API អាចនឹងបដិសេធ (HTTP 403 Forbidden) ដោយសារ geo/IP restriction។
-#      ដំណោះស្រាយ: ប្រើ Bakong Relay (RBK Token ពី https://bakongrelay.com) ជំនួស
-#      Bakong Token ធម្មតា ដែល bakong-khqr SDK support ដោយផ្ទាល់ (គ្មានកូដផ្លាស់ប្តូរ)។
-#   3) API check-by-md5 អនុវត្តតែលើ Dynamic KHQR ប៉ុណ្ណោះ (static=False ដែលយើងប្រើ)។
-#      QR មានសុពលភាពមិនលើសពី ~10 នាទីតាមអនុសាសន៍ផ្លូវការ។
-#   4) v0.6.0+ គាំទ្រ "Smart Polling": ហៅ check_payment(md5, start_time=...) នឹងត្រឡប់
-#      (status, next_delay) ជំនួសពី string ធម្មតា — កាត់បន្ថយ API call ច្រើន (5s ដំបូង
-#      -> 10s -> 15s -> 300s តាមពេលកន្លងទៅ) ជៀសវាងអស់ quota Token។
-BAKONG_USE_RELAY = os.environ.get("BAKONG_USE_RELAY", "false").lower() == "true"
-_bakong_token_warned = False  # ជៀសវាងផ្ញើសារព្រមានដដែលៗច្រើនដង
+# -------------------- KHQR (CamRapidPay) --------------------
+# ប្រើ CamRapidPay REST API (https://api.camrapidpay.com) ជំនួស Bakong Open API ផ្ទាល់។
+# ⚠️ Field names ខាងក្រោមជា ការស្មានល្អបំផុត (best-effort) ពី REST convention ទូទៅ —
+# សូមផ្ទៀងផ្ទាត់ជាមួយ portal.camrapidpay.com/docs (login ជាមួយ API Key ផ្ទាល់ខ្លួន)
+# រួច​ប្រើ admin command /testpay ដើម្បីសាកល្បង $0.01 មុនចាប់ផ្តើមលក់ពិត។ បើ field
+# ណាមួយខុស សូម copy error message មកឲ្យខ្ញុំកែតាម response ពិត។
+_camrapidpay_warned = False  # ជៀសវាងផ្ញើសារព្រមានដដែលៗច្រើនដង
 
 
-def _notify_admin_bakong_issue(reason: str):
-    """ជូនដំណឹង admin តែម្តងគត់ក្នុងមួយ run លើបញ្ហា Bakong (403 geo-block / token invalid)"""
-    global _bakong_token_warned
-    if _bakong_token_warned:
+def _camrapidpay_header_variants():
+    """ព្យាយាមទម្រង់ header ស្តង់ដារជាច្រើន ព្រោះមិនដឹងច្បាស់ថា API ត្រូវការទម្រង់ណា"""
+    base = {"Content-Type": "application/json"}
+    return [
+        {**base, "X-API-Key": CAMRAPIDPAY_API_KEY, "X-Secret-Key": CAMRAPIDPAY_SECRET},
+        {**base, "api-key": CAMRAPIDPAY_API_KEY, "secret-key": CAMRAPIDPAY_SECRET},
+        {**base, "Authorization": f"Bearer {CAMRAPIDPAY_API_KEY}"},
+        {**base, "Authorization": f"Bearer {CAMRAPIDPAY_API_KEY}:{CAMRAPIDPAY_SECRET}"},
+    ]
+
+
+def _webhook_url():
+    if not RENDER_EXTERNAL_URL:
+        return "https://example.invalid/webhook/camrapidpay"  # placeholder — QR នៅតែបង្កើតបាន តែ webhook មិនចូលទេ
+    return f"{RENDER_EXTERNAL_URL}/webhook/camrapidpay"
+
+
+def _notify_admin_camrapidpay_issue(reason: str):
+    """ជូនដំណឹង admin តែម្តងគត់ក្នុងមួយ run លើបញ្ហា CamRapidPay (auth/schema/connectivity)"""
+    global _camrapidpay_warned
+    if _camrapidpay_warned:
         return
-    _bakong_token_warned = True
+    _camrapidpay_warned = True
     try:
         bot.send_message(
             ADMIN_ID,
-            f"⚠️ <b>Bakong KHQR មានបញ្ហា</b>\n\n{reason}\n\n"
-            f"💡 បើ server នេះមិនមែននៅកម្ពុជា (ឧ. Render) Bakong Open API អាចនឹង "
-            f"បដិសេធសំណើ (403) ។ ដំណោះស្រាយ: ចុះឈ្មោះ RBK Token នៅ bakongrelay.com "
-            f"រួចដាក់ BAKONG_TOKEN ជា RBK token ហើយកំណត់ BAKONG_USE_RELAY=true។",
+            f"⚠️ <b>CamRapidPay មានបញ្ហា</b>\n\n{reason}\n\n"
+            f"💡 សូមប្រើ /testpay ដើម្បីមើល error លម្អិត រួច copy ជូន developer កែ។",
         )
     except Exception:
         pass
 
 
+# Endpoint path candidates — ព្យាយាមតាមលំដាប់ រហូតជួប status 2xx
+_CREATE_PATHS = ["/api/v1/create-payments", "/api/v1/create-payment", "/api/create-payment"]
+_CHECK_PATHS = ["/api/v1/check-payment/{id}", "/api/v1/check-transaction/{id}", "/api/check-payment/{id}"]
+
+
 def create_khqr(amount_usd, order_id):
     """
-    ប្រើ bakong_khqr library (official Bakong Open API wrapper)។
-    ត្រឡប់ dict: {"qr_string":..., "md5":..., "client":..., "created_at": float} ឬ None បើបរាជ័យ។
+    ព្យាយាមហៅ CamRapidPay តាម endpoint path + header variant ជាច្រើន រហូតជោគជ័យ។
+    ត្រឡប់ dict: {"qr_string":..., "md5":..., "created_at": float} ឬ None បើគ្រប់ variant បរាជ័យ។
     """
-    try:
-        from bakong_khqr import KHQR
-        khqr_client = KHQR(BAKONG_TOKEN)
-        qr_string = khqr_client.create_qr(
-            account_id=BAKONG_ACCOUNT_ID,  # ឈ្មោះ parameter ថ្មី (bank_account ចាស់ deprecated)
-            merchant_name=MERCHANT_NAME,
-            merchant_city="Phnom Penh",
-            amount=float(amount_usd),
-            currency="USD",
-            store_label="KaiGift",
-            phone_number="",
-            bill_number=order_id,
-            terminal_label="KaiGiftBot",
-            static=False,   # ត្រូវតែ Dynamic ដើម្បីអាច check-by-md5 បាន
-            expiration=1,   # ថ្ងៃ (poll_payment ខាងក្រោមកំណត់ timeout ខ្លីជាងនេះ ~10 នាទី)
-        )
-        md5_hash = khqr_client.generate_md5(qr_string)
-        return {"qr_string": qr_string, "md5": md5_hash, "client": khqr_client, "created_at": time.time()}
-    except Exception as e:
-        err = str(e)
-        log.error(f"KHQR create error: {err}")
-        if "403" in err or "Forbidden" in err:
-            _notify_admin_bakong_issue(f"បរាជ័យបង្កើត KHQR (403 Forbidden): {err}")
-        return None
+    payload = {
+        "amount": float(amount_usd),
+        "currency": "USD",
+        "bakong_account_id": BAKONG_ACCOUNT_ID,
+        "account_id": BAKONG_ACCOUNT_ID,  # alias — ខ្លះ API ប្រើឈ្មោះនេះ
+        "merchant_name": MERCHANT_NAME,
+        "merchant_city": "Phnom Penh",
+        "bill_number": order_id,
+        "order_id": order_id,  # alias
+        "store_label": "KaiGift",
+        "terminal_label": "KaiGiftBot",
+        "webhook_url": _webhook_url(),  # mandatory field (រកឃើញកាលពីមុនក្នុងគម្រោង Kaijaklike)
+        "api_key": CAMRAPIDPAY_API_KEY,   # ខ្លះទាមទារក្នុង body ជំនួស/បន្ថែមពី header
+        "secret_key": CAMRAPIDPAY_SECRET,
+    }
+    attempts_log = []
+    for path in _CREATE_PATHS:
+        for headers in _camrapidpay_header_variants():
+            try:
+                resp = requests.post(
+                    f"{CAMRAPIDPAY_BASE_URL}{path}", headers=headers, json=payload, timeout=15
+                )
+                if resp.status_code >= 400:
+                    attempts_log.append(f"{path} [{list(headers.keys())[1]}] -> HTTP {resp.status_code}: {resp.text[:150]}")
+                    continue
+                data = resp.json()
+                body = data.get("data", data)
+                qr_string = body.get("qr_string") or body.get("qr") or body.get("khqr_string") or body.get("qr_code")
+                payment_id = body.get("md5") or body.get("transaction_id") or body.get("payment_id") or body.get("id")
+                if qr_string and payment_id:
+                    log.info(f"CamRapidPay create OK via {path}")
+                    return {"qr_string": qr_string, "md5": payment_id, "created_at": time.time()}
+                attempts_log.append(f"{path} -> 2xx but missing qr/md5 field. Raw: {data}")
+            except Exception as e:
+                attempts_log.append(f"{path} -> exception: {e}")
+    # គ្រប់ variant បរាជ័យ
+    detail = "\n".join(attempts_log[:6])
+    log.error(f"CamRapidPay create-payments ALL attempts failed:\n{detail}")
+    _notify_admin_camrapidpay_issue(f"បរាជ័យបង្កើត QR (គ្រប់ endpoint/header variant):\n{detail}")
+    return None
 
 
-def check_khqr_status(khqr_client, md5_hash, start_time=None):
-    """
-    ត្រឡប់ (is_paid: bool, next_delay: int)។ ប្រើ Smart Polling (v0.6.0+) បើ start_time
-    ត្រូវបានផ្តល់ — fallback ទៅ legacy call + fixed delay បើ library ចាស់ជាងមិន support។
-    """
-    try:
-        if start_time is not None:
-            result = khqr_client.check_payment(md5_hash, start_time=start_time)
-            if isinstance(result, tuple):
-                status, next_delay = result
-                return status == "PAID", int(next_delay)
-            return result == "PAID", 5  # library ចាស់ត្រឡប់ string តែម្នាក់ despite start_time
-        status = khqr_client.check_payment(md5_hash)
-        return status == "PAID", 5
-    except Exception as e:
-        err = str(e)
-        log.error(f"KHQR check error: {err}")
-        if "403" in err or "Forbidden" in err:
-            _notify_admin_bakong_issue(f"បរាជ័យ check payment (403 Forbidden): {err}")
-        return False, 5
+def check_khqr_status(payment_id):
+    """ព្យាយាមហៅ CamRapidPay check endpoint តាម path variant ជាច្រើន។ ត្រឡប់ (is_paid, next_delay)"""
+    attempts_log = []
+    for path_tpl in _CHECK_PATHS:
+        path = path_tpl.format(id=payment_id)
+        for headers in _camrapidpay_header_variants():
+            try:
+                resp = requests.get(f"{CAMRAPIDPAY_BASE_URL}{path}", headers=headers, timeout=15)
+                if resp.status_code >= 400:
+                    attempts_log.append(f"{path} -> HTTP {resp.status_code}: {resp.text[:150]}")
+                    continue
+                data = resp.json()
+                body = data.get("data", data)
+                status = str(body.get("status", "")).upper()
+                return status == "PAID", 5
+            except Exception as e:
+                attempts_log.append(f"{path} -> exception: {e}")
+    detail = "\n".join(attempts_log[:6])
+    log.error(f"CamRapidPay check ALL attempts failed:\n{detail}")
+    _notify_admin_camrapidpay_issue(f"បរាជ័យ check payment (គ្រប់ endpoint/header variant):\n{detail}")
+    return False, 5
 
 
-def poll_payment(order_id, khqr_client, md5_hash, timeout_sec=600, created_at=None):
-    """Background thread: Smart Polling រហូតបានលុយ ឬ timeout (matrix: 5s→10s→15s→300s)"""
+def poll_payment(order_id, payment_id, timeout_sec=600, created_at=None):
+    """Background thread: poll រៀងរាល់ ~5s រហូតបានលុយ ឬ timeout (10 នាទី)"""
     start = created_at or time.time()
     while time.time() - start < timeout_sec:
         orders = load_orders()
         order = orders.get(order_id)
         if not order or order.get("status") != "awaiting_payment":
             return  # cancelled/changed elsewhere
-        is_paid, next_delay = check_khqr_status(khqr_client, md5_hash, start_time=start)
+        is_paid, next_delay = check_khqr_status(payment_id)
         if is_paid:
             order["status"] = "paid_pending_delivery"
             order["paid_at"] = datetime.now().isoformat()
@@ -482,10 +523,16 @@ def cmd_start(msg):
     text, entities = build_catalog_message(gifts)
     markup = types.InlineKeyboardMarkup(row_width=1)
     for gid, g in gifts.items():
-        btn_text = f"{g.get('emoji', '🎁')} {g['name']} — ${g['price']}"
+        premium_id = g.get("premium_emoji_id")
+        # បើមាន premium_emoji_id, icon នឹងបង្ហាញផ្ទាល់ខ្លួនរួចហើយ —
+        # កុំដាក់ fallback emoji ក្នុង text ទៀត ដើម្បីកុំឲ្យបង្ហាញជាន់គ្នា (🌹🌹)
+        if premium_id:
+            btn_text = f"{g['name']} — ${g['price']}"
+        else:
+            btn_text = f"{g.get('emoji', '🎁')} {g['name']} — ${g['price']}"
         markup.add(build_button(
             btn_text, f"pick:{gid}",
-            icon_custom_emoji_id=g.get("premium_emoji_id"),
+            icon_custom_emoji_id=premium_id,
         ))
     safe_send_message(msg.chat.id, text, entities=entities, reply_markup=markup)
 
@@ -632,7 +679,7 @@ def cb_confirm_order(call):
 
     t = threading.Thread(
         target=poll_payment,
-        args=(order_id, qr_data["client"], qr_data["md5"]),
+        args=(order_id, qr_data["md5"]),
         kwargs={"created_at": qr_data.get("created_at")},
         daemon=True,
     )
@@ -1073,6 +1120,44 @@ def cb_stats(call):
     bot.send_message(call.message.chat.id, render_stats_text(), reply_markup=admin_main_menu_markup())
 
 
+@bot.message_handler(commands=["testpay"])
+def cmd_testpay(msg):
+    """Admin-only: សាកល្បង CamRapidPay ដោយបង្កើត QR $0.01 ផ្ទាល់ — ប្រើដើម្បីផ្ទៀងផ្ទាត់
+    API Key/Secret និង field schema មុនចាប់ផ្តើមលក់ពិត។"""
+    if not is_admin(msg.from_user.id):
+        return
+    bot.send_message(msg.chat.id, "⏳ កំពុងសាកល្បង CamRapidPay...")
+    test_order_id = "TESTPAY_" + uuid.uuid4().hex[:8]
+    qr_data = create_khqr(0.01, test_order_id)
+    if not qr_data:
+        bot.send_message(
+            msg.chat.id,
+            "❌ បរាជ័យបង្កើត QR — មើល Render Logs សម្រាប់ error លម្អិត "
+            "(ប្រហែល field name ខុស ឬ API Key/Secret មិនត្រឹមត្រូវ)។",
+        )
+        return
+    bot.send_message(
+        msg.chat.id,
+        f"✅ បង្កើត QR ជោគជ័យ!\n\n"
+        f"🆔 payment_id: <code>{qr_data['md5']}</code>\n\n"
+        f"💳 QR String:\n<code>{qr_data['qr_string']}</code>\n\n"
+        f"សូមស្កេន QR នេះទូទាត់ $0.01 ដើម្បីសាកល្បង auto-detect (រង់ចាំ ~10-15 វិនាទីរួច /checkpay)",
+    )
+
+
+@bot.message_handler(commands=["checkpay"])
+def cmd_checkpay(msg):
+    """Admin-only: check ស្ថានភាព payment_id ចុងក្រោយពី /testpay (paste payment_id ជា argument)"""
+    if not is_admin(msg.from_user.id):
+        return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.send_message(msg.chat.id, "សូមប្រើទម្រង់: /checkpay <payment_id>")
+        return
+    is_paid, _ = check_khqr_status(parts[1].strip())
+    bot.send_message(msg.chat.id, f"ស្ថានភាព: {'✅ PAID' if is_paid else '⏳ មិនទាន់ទូទាត់ (UNPAID)'}")
+
+
 def _global_exception_wrapper():
     while True:
         try:
@@ -1083,31 +1168,25 @@ def _global_exception_wrapper():
             time.sleep(5)
 
 
-def _startup_bakong_healthcheck():
-    """ត្រួតពិនិត្យថា Bakong Token/Server ដំណើរការមុនពេលទទួល order — ជូនដំណឹង admin ជាមុន
-    បើមានបញ្ហា (403 geo-block ឬ token ផុតកំណត់) ជំនួសឲ្យរង់ចាំ customer ជួបបញ្ហាដំបូង"""
+def _startup_camrapidpay_healthcheck():
+    """ត្រួតពិនិត្យថា CamRapidPay Key/Server ដំណើរការមុនពេលទទួល order — ជូនដំណឹង admin ជាមុន
+    បើមានបញ្ហា (auth/schema/connectivity) ជំនួសឲ្យរង់ចាំ customer ជួបបញ្ហាដំបូង"""
     try:
-        from bakong_khqr import KHQR
-        test_client = KHQR(BAKONG_TOKEN)
-        test_qr = test_client.create_qr(
-            account_id=BAKONG_ACCOUNT_ID, merchant_name=MERCHANT_NAME,
-            merchant_city="Phnom Penh", amount=0.01, currency="USD",
-            store_label="HealthCheck", bill_number="STARTUP_TEST", static=False, expiration=1,
-        )
-        test_md5 = test_client.generate_md5(test_qr)
-        test_client.check_payment(test_md5)  # គ្រាន់តែសាកល្បង connectivity/token
-        log.info("Bakong KHQR health-check: OK")
+        qr_data = create_khqr(0.01, "STARTUP_TEST_" + uuid.uuid4().hex[:8])
+        if not qr_data:
+            raise RuntimeError("create_khqr ត្រឡប់ None — មើល error លម្អិតខាងលើ log")
+        is_paid, _ = check_khqr_status(qr_data["md5"])  # គ្រាន់តែសាកល្បង connectivity/auth
+        log.info(f"CamRapidPay health-check: OK (is_paid={is_paid})")
     except Exception as e:
         err = str(e)
-        log.error(f"Bakong KHQR health-check FAILED: {err}")
-        reason = "403 Forbidden (server នេះប្រហែលនៅក្រៅកម្ពុជា)" if "403" in err else err
+        log.error(f"CamRapidPay health-check FAILED: {err}")
         try:
             bot.send_message(
                 ADMIN_ID,
-                f"🔴 <b>Bakong Health-Check បរាជ័យ</b> ពេល bot ចាប់ផ្តើម!\n\n{reason}\n\n"
+                f"🔴 <b>CamRapidPay Health-Check បរាជ័យ</b> ពេល bot ចាប់ផ្តើម!\n\n{err}\n\n"
                 f"KHQR payment នឹងមិនដំណើរការទេ រហូតដល់កែបញ្ហានេះ។ "
-                f"សូមពិនិត្យ BAKONG_TOKEN/BAKONG_ACCOUNT_ID ឬប្រើ Bakong Relay (bakongrelay.com) "
-                f"បើ server នេះ host នៅក្រៅកម្ពុជា។",
+                f"សូមពិនិត្យ CAMRAPIDPAY_API_KEY/CAMRAPIDPAY_SECRET និង field names ជាមួយ "
+                f"portal.camrapidpay.com/docs។",
             )
         except Exception:
             pass
@@ -1130,5 +1209,5 @@ if __name__ == "__main__":
     except ImportError:
         pass
 
-    threading.Thread(target=_startup_bakong_healthcheck, daemon=True).start()
+    threading.Thread(target=_startup_camrapidpay_healthcheck, daemon=True).start()
     _global_exception_wrapper()
