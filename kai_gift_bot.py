@@ -68,6 +68,7 @@ DATA_DIR = os.environ.get("DATA_DIR", "./data")
 os.makedirs(DATA_DIR, exist_ok=True)
 GIFTS_FILE = os.path.join(DATA_DIR, "gifts.json")
 ORDERS_FILE = os.path.join(DATA_DIR, "orders.json")
+GLOBAL_EMOJI_FILE = os.path.join(DATA_DIR, "global_premium_emoji.json")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("kai_gift_bot")
@@ -75,7 +76,77 @@ log = logging.getLogger("kai_gift_bot")
 if not BOT_TOKEN:
     raise RuntimeError("សូមកំណត់ BOT_TOKEN environment variable")
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+# -------------------- ERROR MONITORING (ជូនដំណឹង Admin ពេលមាន Error ច្រើនដងក្នុងរយៈពេលខ្លី) --------------------
+# គំនិត: error តែម្តងម្កាល (ឧ. user វាយខុស format) មិនចាំបាច់រំខាន Admin ទេ — ប៉ុន្តែបើ
+# error កើតឡើងញឹកញាប់ក្នុងរយៈពេលខ្លី (ជាទូទៅមានន័យថា bot/API មានបញ្ហាជាប្រព័ន្ធ ឧ.
+# CamRapidPay គាំង, bug ថ្មី ។ល។) bot នឹងផ្ញើសារជូនដំណឹង Admin ស្វ័យប្រវត្តិភ្លាមៗ ព្រម
+# ព័ត៌មាន error ចុងក្រោយៗ ដើម្បីជួយ debug លឿន។ មាន cooldown ជៀសវាងសារហៀរច្រើនពេក។
+ERROR_ALERT_THRESHOLD = int(os.environ.get("ERROR_ALERT_THRESHOLD", "5"))       # ចំនួន error អប្បបរមាមុននឹងជូនដំណឹង
+ERROR_ALERT_WINDOW_SEC = int(os.environ.get("ERROR_ALERT_WINDOW_SEC", "300"))   # រយៈពេលរាប់ (5 នាទី)
+ERROR_ALERT_COOLDOWN_SEC = int(os.environ.get("ERROR_ALERT_COOLDOWN_SEC", "600"))  # ចន្លោះពេលអប្បបរមារវាងសារ (10 នាទី)
+
+_error_events = []        # list នៃ (timestamp, source, error_text) ក្នុងបង្អួច window បច្ចុប្បន្ន
+_last_error_alert_at = 0.0
+_error_lock = threading.Lock()
+
+
+def _record_error(source: str, exc: Exception):
+    """កត់ត្រា error មួយពី source ណាមួយ (ឧ. \"handler\", \"create_khqr\", \"polling\")។
+    បើចំនួន error ក្នុងបង្អួច ERROR_ALERT_WINDOW_SEC វិនាទីចុងក្រោយ ≥ ERROR_ALERT_THRESHOLD
+    bot នឹងផ្ញើសារជូនដំណឹង Admin ស្វ័យប្រវត្តិ (មិនលើសពី ១ដងក្នុងរយៈពេល
+    ERROR_ALERT_COOLDOWN_SEC ដើម្បីកុំឲ្យសារហៀរច្រើនពេក)។"""
+    global _last_error_alert_at
+    now = time.time()
+    err_text = f"{type(exc).__name__}: {exc}"
+    log.error(f"[{source}] {err_text}")
+    snapshot = None
+    with _error_lock:
+        _error_events.append((now, source, err_text))
+        while _error_events and _error_events[0][0] < now - ERROR_ALERT_WINDOW_SEC:
+            _error_events.pop(0)
+        recent_count = len(_error_events)
+        if recent_count >= ERROR_ALERT_THRESHOLD and (now - _last_error_alert_at) > ERROR_ALERT_COOLDOWN_SEC:
+            _last_error_alert_at = now
+            snapshot = list(_error_events)
+    if snapshot:
+        _send_error_alert(len(snapshot), snapshot)
+
+
+def _send_error_alert(count, snapshot):
+    lines = [
+        "🚨 <b>Bot កំពុងជួប Error ច្រើនហួសប្រមាណ!</b>",
+        "",
+        f"📊 {count} errors ក្នុងរយៈពេល {ERROR_ALERT_WINDOW_SEC // 60} នាទីចុងក្រោយ",
+        "",
+        "🔎 <b>Error ថ្មីៗ:</b>",
+    ]
+    for ts, source, err_text in snapshot[-5:]:
+        t = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+        short = err_text if len(err_text) <= 150 else err_text[:150] + "…"
+        lines.append(f"• {t} [{source}] {short}")
+    lines.append("")
+    lines.append("💡 សូមពិនិត្យ Render logs ដើម្បីមើលលម្អិត ឬវាយ /errorlog")
+    try:
+        bot.send_message(ADMIN_ID, "\n".join(lines))
+    except Exception as e:
+        log.error(f"[_send_error_alert] failed to notify admin: {e}")
+
+
+class _LoggingExceptionHandler(telebot.ExceptionHandler):
+    """ចាប់ Exception ណាមួយកើតឡើងក្នុង message/callback handler ណាមួយ (បើគ្មាន handler
+    នេះ pyTelegramBotAPI នឹងលេប exception ចោលស្ងាត់ៗ ធ្វើឲ្យ user ចុច button ហើយគ្មានអ្វី
+    កើតឡើងសោះ)។ ត្រង់នេះ log ចេញ Render logs ជានិច្ច ព្រមទាំងកត់ត្រាទុកសម្រាប់ជូនដំណឹង
+    Admin ស្វ័យប្រវត្តិបើកើតច្រើនដង (មើល _record_error)។ bot នៅតែបន្តដំណើរការធម្មតា
+    សម្រាប់ update បន្ទាប់ (មិនគាំង) ព្រោះ return True។"""
+    def handle(self, exception):
+        import traceback
+        traceback.print_exc()
+        _record_error("handler", exception)
+        return True
+
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", exception_handler=_LoggingExceptionHandler())
 
 # -------------------- STORAGE HELPERS --------------------
 _lock = threading.Lock()
@@ -281,28 +352,236 @@ def safe_edit_message_text(text, chat_id, message_id, entities=None, reply_marku
             return None
 
 
-def build_button(text, callback_data, icon_custom_emoji_id=None, style=None):
+# -------------------- GLOBAL PREMIUM EMOJI (Setup Emoji — អនុវត្តគ្រប់កន្លែង) --------------------
+# ខុសពី premium_emoji_id ក្នុង gifts.json (ជាក់លាក់ក្នុងមួយ Gift) — ត្រង់នេះជា "global
+# map" មួយ ដែល admin ភ្ជាប់ glyph ធម្មតា (ឧ. ✅ ❌ 🔙 ➕ ➖ 🎁 💵 ។ល។) ទៅនឹង Premium Emoji
+# ID ម្តង ចាប់ពីនោះទៅ *គ្រប់ទីកន្លែង* ក្នុង Bot (ប៊ូតុង admin panel, សារបញ្ជាក់ order,
+# សារជូនដំណឹង ។ល។) ដែលមាន glyph នោះ នឹងបង្ហាញ icon premium ស្វ័យប្រវត្តិ — មិនចាំបាច់
+# កំណត់ម្តងមួយៗដូច per-gift emoji ទេ។
+EMOJI_CATEGORIES = [
+    ("✅", "✅ ជោគជ័យ / បញ្ជាក់"),
+    ("❌", "❌ បោះបង់ / បដិសេធ"),
+    ("◀️", "◀️ ត្រឡប់ក្រោយ"),
+    ("🔙", "🔙 ត្រឡប់ក្រោយ (ផ្សេង)"),
+    ("➕", "➕ បន្ថែម"),
+    ("➖", "➖ បន្ថយ"),
+    ("🎁", "🎁 Gift"),
+    ("💵", "💵 តម្លៃ/ប្រាក់"),
+    ("💳", "💳 ការទូទាត់"),
+    ("📦", "📦 Order"),
+    ("📋", "📋 បញ្ជី"),
+    ("📊", "📊 ស្ថិតិ"),
+    ("🛠", "🛠 Admin Panel"),
+    ("🗑", "🗑 លុប/ដក"),
+    ("⏳", "⏳ កំពុងរង់ចាំ"),
+    ("⌛", "⌛ ផុតកំណត់"),
+    ("⚠️", "⚠️ ប្រុងប្រយ័ត្ន"),
+    ("🚨", "🚨 បន្ទាន់ (Admin alert)"),
+    ("🔔", "🔔 ជូនដំណឹង"),
+    ("📢", "📢 Broadcast"),
+    ("📨", "📨 សំណើ/សារ"),
+    ("🔁", "🔁 ព្យាយាមម្តងទៀត"),
+    ("☎️", "☎️ ទំនាក់ទំនង"),
+    ("👉", "👉 ចង្អុលបង្ហាញ"),
+    ("👋", "👋 សួស្តី"),
+    ("👥", "👥 អ្នកប្រើប្រាស់"),
+    ("🏠", "🏠 ម៉ឺនុយចម្បង"),
+    ("📱", "📱 ស្កេន QR"),
+    ("😀", "😀 Setup Premium Emoji"),
+    ("✏️", "✏️ កែ/បញ្ចូលព័ត៌មាន"),
+    ("👤", "👤 អ្នកប្រើប្រាស់ម្នាក់"),
+    ("ℹ️", "ℹ️ ព័ត៌មាន"),
+    ("🔎", "🔎 ស្វែងរក/Debug"),
+    ("✨", "✨ ការណែនាំ/Tips"),
+    ("🙏", "🙏 អរគុណ"),
+    ("🎉", "🎉 អបអរ"),
+    ("🔗", "🔗 តំណភ្ជាប់"),
+    ("★", "★ Premium badge"),
+]
+
+
+def get_emoji_map():
+    return _load(GLOBAL_EMOJI_FILE, {})
+
+
+def save_emoji_map(m):
+    _save(GLOBAL_EMOJI_FILE, m)
+
+
+def emoji_icon_for(text):
+    """រកមើលថាតើ text (ជាធម្មតាជា label ប៊ូតុង) មាន glyph ណាមួយក្នុង global map រួច
+    — return (glyph, custom_emoji_id) ដំបូងដែលរកឃើញ, ឬ (None, None) បើគ្មាន។"""
+    m = get_emoji_map()
+    if not m:
+        return None, None
+    for glyph in sorted(m.keys(), key=len, reverse=True):
+        if glyph and glyph in text:
+            icon_id = m[glyph].get("custom_emoji_id")
+            if icon_id:
+                return glyph, icon_id
+    return None, None
+
+
+def _strip_glyph(text, glyph):
+    """លុប glyph ធម្មតាចេញពី label (ព្រោះ icon premium បង្ហាញជំនួសរួចហើយ) — បើលុបហើយ
+    label ក្លាយជាទទេ រក្សា text ដើមទុក ដើម្បីកុំឲ្យ Telegram បដិសេធ button text ទទេ។"""
+    if not glyph:
+        return text
+    cleaned = text.replace(glyph, "", 1)
+    cleaned = " ".join(cleaned.split())
+    return cleaned if cleaned else text
+
+
+def premium_text(text):
+    """ជំនួស glyph ធម្មតា (ឧ. ✅) ដោយ HTML <tg-emoji> tag នៅគ្រប់ទីកន្លែងក្នុង text
+    (សម្រាប់សារ parse_mode=HTML ធម្មតា — មិនអនុវត្តលើសារដែលប្រើ entities ផ្ទាល់ខ្លួន
+    ដូចជា catalog/order message ដែលមាន per-gift premium emoji រួចស្រាប់ទេ)។ ប្រើ
+    placeholder token ជាមុនសិន រួច replace ត្រឡប់ជា HTML នៅចុងក្រោយតែម្តង ដើម្បីកុំឲ្យ
+    វគ្គបន្ទាប់ replace ត្រូវលើ tag ដែលបានបញ្ចូលរួច (ជៀសវាង nested/broken tag)។"""
+    if not text:
+        return text
+    m = get_emoji_map()
+    if not m:
+        return text
+    items = sorted(m.items(), key=lambda kv: len(kv[0]), reverse=True)
+    placeholders = {}
+    for i, (glyph, info) in enumerate(items):
+        icon_id = info.get("custom_emoji_id")
+        if not icon_id or not glyph or glyph not in text:
+            continue
+        token = f"\x00PE{i}\x00"
+        text = text.replace(glyph, token)
+        placeholders[token] = f'<tg-emoji emoji-id="{icon_id}">{glyph}</tg-emoji>'
+    for token, tag_html in placeholders.items():
+        text = text.replace(token, tag_html)
+    return text
+
+
+def _is_entity_parse_error(exc):
+    """រកមើលថាតើ exception នេះទាក់ទងនឹង tg-emoji/entity ដែរឬអត់ (ឧ. "can't parse
+    entities" ឬ "ENTITY_TEXT_INVALID" ព្រោះ custom_emoji_id លែងមាន) — ករណីណាក៏ដោយ
+    គួរតែ retry ដោយអត្ថបទធម្មតា ជាជាងឲ្យសារបាត់សោះ។"""
+    return "entit" in str(exc).lower()
+
+
+def _should_skip_global_emoji(kwargs):
+    """សារដែលហៅ entities=... ផ្ទាល់ខ្លួន (ឧ. safe_send_message ជាមួយ per-gift premium
+    emoji, parse_mode=None) មិនត្រូវអនុវត្ត global premium_text() ជាន់ទៀតទេ — បើមិន
+    ដូច្នេះ tag HTML នឹងលេចចេញជាអត្ថបទដើមដោយសារ parse_mode=None។"""
+    return bool(kwargs.get("entities")) or ("parse_mode" in kwargs and kwargs.get("parse_mode") is None)
+
+
+# --- Auto-apply premium_text() លើសារគ្រប់ប្រភេទដែល bot ផ្ញើ (monkey-patch) ---
+_orig_send_message = bot.send_message
+_orig_reply_to = bot.reply_to
+_orig_edit_message_text = bot.edit_message_text
+_orig_edit_message_caption = bot.edit_message_caption
+_orig_send_photo = bot.send_photo
+
+
+def _patched_send_message(chat_id, text=None, *args, **kwargs):
+    if _should_skip_global_emoji(kwargs):
+        return _orig_send_message(chat_id, text, *args, **kwargs)
+    try:
+        return _orig_send_message(chat_id, premium_text(text), *args, **kwargs)
+    except Exception as e:
+        if _is_entity_parse_error(e):
+            log.warning(f"[premium_text] entity parse failed, retrying plain text: {e}")
+            return _orig_send_message(chat_id, text, *args, **kwargs)
+        raise
+
+
+def _patched_reply_to(message, text=None, *args, **kwargs):
+    if _should_skip_global_emoji(kwargs):
+        return _orig_reply_to(message, text, *args, **kwargs)
+    try:
+        return _orig_reply_to(message, premium_text(text), *args, **kwargs)
+    except Exception as e:
+        if _is_entity_parse_error(e):
+            log.warning(f"[premium_text] entity parse failed, retrying plain text: {e}")
+            return _orig_reply_to(message, text, *args, **kwargs)
+        raise
+
+
+def _patched_edit_message_text(text=None, *args, **kwargs):
+    if _should_skip_global_emoji(kwargs):
+        return _orig_edit_message_text(text, *args, **kwargs)
+    try:
+        return _orig_edit_message_text(premium_text(text), *args, **kwargs)
+    except Exception as e:
+        if _is_entity_parse_error(e):
+            log.warning(f"[premium_text] entity parse failed, retrying plain text: {e}")
+            return _orig_edit_message_text(text, *args, **kwargs)
+        raise
+
+
+def _patched_edit_message_caption(caption=None, *args, **kwargs):
+    if _should_skip_global_emoji(kwargs):
+        return _orig_edit_message_caption(caption, *args, **kwargs)
+    try:
+        return _orig_edit_message_caption(premium_text(caption), *args, **kwargs)
+    except Exception as e:
+        if _is_entity_parse_error(e):
+            log.warning(f"[premium_text] entity parse failed, retrying plain caption: {e}")
+            return _orig_edit_message_caption(caption, *args, **kwargs)
+        raise
+
+
+def _patched_send_photo(chat_id, photo, caption=None, *args, **kwargs):
+    if _should_skip_global_emoji(kwargs):
+        return _orig_send_photo(chat_id, photo, caption, *args, **kwargs)
+    try:
+        return _orig_send_photo(chat_id, photo, premium_text(caption), *args, **kwargs)
+    except Exception as e:
+        if _is_entity_parse_error(e):
+            log.warning(f"[premium_text] entity parse failed, retrying plain caption: {e}")
+            return _orig_send_photo(chat_id, photo, caption, *args, **kwargs)
+        raise
+
+
+bot.send_message = _patched_send_message
+bot.reply_to = _patched_reply_to
+bot.edit_message_text = _patched_edit_message_text
+bot.edit_message_caption = _patched_edit_message_caption
+bot.send_photo = _patched_send_photo
+
+
+def build_button(text, callback_data=None, icon_custom_emoji_id=None, style=None, url=None):
     """
-    សង់ InlineKeyboardButton ជាមួយ icon_custom_emoji_id/style (Bot API 9.4+)
+    សង់ InlineKeyboardButton ជាមួយ icon_custom_emoji_id/style (Bot API 9.4+)។
+    - icon_custom_emoji_id ដែលបញ្ជូនមកផ្ទាល់ (ឧ. per-gift premium emoji) មានអាទិភាពជាងគេ។
+    - បើគ្មានបញ្ជូនមក ស្វែងរកក្នុង global emoji map (កំណត់ដោយ 😀 ដាក់ Premium Emoji ក្នុង
+      Admin Panel / /setupemoji) ថាតើ text នេះមាន glyph ណាមួយត្រូវគ្នាដែរឬអត់ — បើមាន
+      ប្រើ icon នោះស្វ័យប្រវត្តិ ព្រមទាំងលុប glyph ធម្មតាចេញ (កុំបង្ហាញស្ទួន)។
+    - url: ប្រសិនបើកំណត់, ធ្វើប៊ូតុងបើក link ជំនួស callback_data (ឧ. "🔗 បើកទំព័រទូទាត់")។
     style ត្រូវតែជាមួយក្នុងចំណោម 3 តម្លៃប៉ុណ្ណោះ (verified ពី Telegram Bot API):
       - "primary" = ខៀវ  (សកម្មភាពសំខាន់/default)
       - "success" = បៃតង (បញ្ជាក់/OK/positive action)
       - "danger"  = ក្រហម (លុប/បោះបង់/destructive action)
-    បើមិនកំណត់ style — Telegram client ប្រើពណ៌ default របស់វា (មិនមែន "secondary"
-    ព្រោះតម្លៃនោះមិនមានទេ — ការសាកល្បងចាស់ខុស)។
     បើ telebot version មិន support field ទាំងនេះ វា fallback ទៅប៊ូតុងធម្មតា
     ដោយស្វ័យប្រវត្តិ (គ្មាន crash) ដោយសារ try/except ខាងក្រោម។
     """
-    kwargs = {}
-    if icon_custom_emoji_id:
-        kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
+    icon_id = str(icon_custom_emoji_id) if icon_custom_emoji_id else None
+    glyph = None
+    if not icon_id:
+        glyph, auto_id = emoji_icon_for(text)
+        if glyph and auto_id:
+            icon_id = str(auto_id)
+    label = _strip_glyph(text, glyph) if (glyph and icon_id) else text
+    attempts = []
+    if style and icon_id:
+        attempts.append({"style": style, "icon_custom_emoji_id": icon_id})
+    if icon_id:
+        attempts.append({"icon_custom_emoji_id": icon_id})
     if style:
-        kwargs["style"] = style  # ឧ. "primary" / "secondary" / "positive" / "negative"
-    try:
-        return types.InlineKeyboardButton(text=text, callback_data=callback_data, **kwargs)
-    except TypeError:
-        # telebot version ចាស់មិនស្គាល់ field ថ្មី -> ធ្វើប៊ូតុងធម្មតា
-        return types.InlineKeyboardButton(text=text, callback_data=callback_data)
+        attempts.append({"style": style})
+    for extra in attempts:
+        use_text = label if "icon_custom_emoji_id" in extra else text
+        try:
+            return types.InlineKeyboardButton(text=use_text, callback_data=callback_data, url=url, **extra)
+        except TypeError:
+            continue
+    return types.InlineKeyboardButton(text=text, callback_data=callback_data, url=url)
 
 
 # -------------------- STATE (in-memory step tracking) --------------------
@@ -407,11 +686,13 @@ def create_khqr(amount_usd, order_id):
         _last_camrapid_error = f"{type(e).__name__}: {e}"
         log.error(f"[create_khqr] transient error: {_last_camrapid_error}")
         _notify_admin_camrapidpay_issue(_last_camrapid_error)
+        _record_error("create_khqr", e)
         return None
     except Exception as e:
         _last_camrapid_error = f"{type(e).__name__}: {e}"
         log.error(f"[create_khqr] error: {_last_camrapid_error}")
         _notify_admin_camrapidpay_issue(_last_camrapid_error)
+        _record_error("create_khqr", e)
         return None
 
 
@@ -432,6 +713,7 @@ def check_khqr_status(payment_id):
     except Exception as e:
         _last_camrapid_error = f"{type(e).__name__}: {e}"
         log.error(f"[check_khqr_status] error: {_last_camrapid_error}")
+        _record_error("check_khqr_status", e)
         return False, 5
 
 
@@ -537,6 +819,7 @@ def cmd_start(msg):
         markup.add(build_button(
             btn_text, f"pick:{gid}",
             icon_custom_emoji_id=premium_id,
+            style="primary",
         ))
     safe_send_message(msg.chat.id, text, entities=entities, reply_markup=markup)
 
@@ -665,7 +948,7 @@ def cb_confirm_order(call):
     kb = None
     if qr_data.get("payment_url"):
         kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("🔗 បើកទំព័រទូទាត់", url=qr_data["payment_url"]))
+        kb.add(build_button("🔗 បើកទំព័រទូទាត់", url=qr_data["payment_url"], style="primary"))
     try:
         import qrcode
         from io import BytesIO
@@ -742,17 +1025,18 @@ def admin_main_menu_markup():
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         build_button("➕ បន្ថែម Gift", "adm:addgift", style="success"),
-        build_button("📋 បញ្ជី Gift", "adm:list"),
+        build_button("📋 បញ្ជី Gift", "adm:list", style="primary"),
     )
     markup.add(
-        build_button("😀 ដាក់ Premium Emoji", "adm:setemoji"),
-        build_button("🗑 ដក Premium Emoji", "adm:removeemoji"),
+        build_button("😀 Premium Emoji (មួយៗ Gift)", "adm:setemoji", style="primary"),
+        build_button("🗑 ដក Emoji Gift", "adm:removeemoji", style="danger"),
     )
+    markup.add(build_button("🎭 Setup Emoji (គ្រប់កន្លែង)", "adm:setupemoji", style="primary"))
     markup.add(
         build_button("❌ លុប Gift", "adm:removegift", style="danger"),
-        build_button("📦 Order កំពុងរង់ចាំ", "adm:orders"),
+        build_button("📦 Order កំពុងរង់ចាំ", "adm:orders", style="primary"),
     )
-    markup.add(build_button("📊 ស្ថិតិ", "adm:stats"))
+    markup.add(build_button("📊 ស្ថិតិ", "adm:stats", style="primary"))
     return markup
 
 
@@ -780,8 +1064,137 @@ def cb_admin_menu(call):
 
 def _back_button_markup():
     m = types.InlineKeyboardMarkup()
-    m.add(build_button("◀️ ត្រឡប់ក្រោយ", "adm:menu"))
+    m.add(build_button("◀️ ត្រឡប់ក្រោយ", "adm:menu", style="primary"))
     return m
+
+
+# ---------- SETUP EMOJI (GLOBAL — គ្រប់កន្លែង) ----------
+def _encode_glyph(glyph):
+    return glyph.encode("utf-8").hex()
+
+
+def _decode_glyph(hex_str):
+    return bytes.fromhex(hex_str).decode("utf-8")
+
+
+def global_emoji_setup_kb():
+    m = get_emoji_map()
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for glyph, label in EMOJI_CATEGORIES:
+        is_set = glyph in m
+        mark = "✅" if is_set else "⬜"
+        style = "success" if is_set else "primary"
+        btn_text = f"{mark} {label}"
+        try:
+            btn = types.InlineKeyboardButton(
+                btn_text, callback_data=f"gemoji_pick_{_encode_glyph(glyph)}", style=style
+            )
+        except TypeError:
+            btn = types.InlineKeyboardButton(btn_text, callback_data=f"gemoji_pick_{_encode_glyph(glyph)}")
+        kb.add(btn)
+    kb.add(build_button("◀️ ត្រឡប់ក្រោយ", "adm:menu", style="primary"))
+    return kb
+
+
+@bot.message_handler(commands=["setupemoji"])
+def cmd_setupemoji(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    bot.send_message(
+        msg.chat.id,
+        "🎭 <b>Setup Premium Emoji (គ្រប់កន្លែង)</b>\n\n"
+        "ជ្រើសរើសប្រភេទខាងក្រោម រួចផ្ញើ Premium Emoji ពិត (ត្រូវការ Telegram Premium) "
+        "ដើម្បីភ្ជាប់ icon នោះទៅគ្រប់ប៊ូតុង/សារក្នុង Bot ទាំងមូលដែលមាន glyph ធម្មតានេះ:",
+        reply_markup=global_emoji_setup_kb(),
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm:setupemoji")
+def cb_admin_setupemoji(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "អ្នកគ្មានសិទ្ធិ")
+        return
+    bot.answer_callback_query(call.id)
+    try:
+        bot.edit_message_text(
+            "🎭 <b>Setup Premium Emoji (គ្រប់កន្លែង)</b>\n\n"
+            "ជ្រើសរើសប្រភេទខាងក្រោម រួចផ្ញើ Premium Emoji ពិត (ត្រូវការ Telegram Premium) "
+            "ដើម្បីភ្ជាប់ icon នោះទៅគ្រប់ប៊ូតុង/សារក្នុង Bot ទាំងមូលដែលមាន glyph ធម្មតានេះ:",
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            reply_markup=global_emoji_setup_kb(),
+        )
+    except Exception:
+        bot.send_message(
+            call.message.chat.id,
+            "🎭 <b>Setup Premium Emoji (គ្រប់កន្លែង)</b>\n\nជ្រើសរើសប្រភេទខាងក្រោម:",
+            reply_markup=global_emoji_setup_kb(),
+        )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("gemoji_"))
+def cb_global_emoji_setup(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id)
+        return
+    data = call.data
+    chat_id = call.message.chat.id
+
+    if data == "gemoji_close":
+        bot.edit_message_text(
+            "🎭 បិទ Setup Emoji។ ប្រើ /setupemoji ម្តងទៀតបើត្រូវការ។",
+            chat_id=chat_id, message_id=call.message.message_id,
+        )
+
+    elif data.startswith("gemoji_pick_"):
+        glyph = _decode_glyph(data[len("gemoji_pick_"):])
+        label = next((l for g, l in EMOJI_CATEGORIES if g == glyph), f"Icon {glyph}")
+        msg = bot.send_message(
+            chat_id,
+            f"📨 សូមផ្ញើ <b>Premium Emoji ពិត</b> សម្រាប់ប្រភេទ:\n{label}\n\n"
+            f"(ត្រូវជា custom emoji ពិតៗ ដែលអ្នកមាន Telegram Premium ចុចផ្ញើ មិនមែន emoji ធម្មតាទេ)",
+        )
+        bot.register_next_step_handler(msg, _global_emoji_capture_step, glyph, label)
+
+    elif data.startswith("gemoji_clear_"):
+        glyph = _decode_glyph(data[len("gemoji_clear_"):])
+        label = next((l for g, l in EMOJI_CATEGORIES if g == glyph), f"Icon {glyph}")
+        m = get_emoji_map()
+        m.pop(glyph, None)
+        save_emoji_map(m)
+        bot.edit_message_text(
+            f"🗑 លុប icon premium សម្រាប់ {label} រួចហើយ។",
+            chat_id=chat_id, message_id=call.message.message_id,
+            reply_markup=global_emoji_setup_kb(),
+        )
+
+    bot.answer_callback_query(call.id)
+
+
+def _global_emoji_capture_step(msg, glyph, label):
+    if not is_admin(msg.from_user.id):
+        return
+    entities = msg.entities or []
+    ce = next((e for e in entities if e.type == "custom_emoji"), None)
+    if not ce:
+        kb = types.InlineKeyboardMarkup()
+        kb.add(build_button("🔁 ព្យាយាមម្តងទៀត", f"gemoji_pick_{_encode_glyph(glyph)}", style="primary"))
+        kb.add(build_button("◀️ ត្រឡប់ក្រោយ", "adm:setupemoji", style="primary"))
+        bot.send_message(
+            msg.chat.id,
+            "❌ រកមិនឃើញ Premium Emoji ក្នុងសារនេះទេ។\nសូមផ្ញើ Premium Emoji ពិត (មិនមែន emoji ធម្មតា) ម្តងទៀត:",
+            reply_markup=kb,
+        )
+        return
+    emoji_char = msg.text[ce.offset: ce.offset + ce.length]
+    m = get_emoji_map()
+    m[glyph] = {"custom_emoji_id": ce.custom_emoji_id, "emoji": emoji_char}
+    save_emoji_map(m)
+    bot.send_message(
+        msg.chat.id,
+        f"✅ <b>{label}</b>\n\nបានភ្ជាប់ Premium Emoji {emoji_char} ទៅ glyph <code>{glyph}</code> រួចហើយ។\n"
+        f"ចាប់ពីនេះទៅ គ្រប់ប៊ូតុង/សារណាដែលមាន {glyph} នឹងបង្ហាញ icon premium ថែមទៀត។",
+        reply_markup=global_emoji_setup_kb(),
+    )
 
 
 # ---------- ADD GIFT ----------
@@ -897,8 +1310,8 @@ def _gift_picker_markup(prefix, only_with_emoji=False):
             continue
         found = True
         label = f"{g.get('emoji','🎁')} {g['name']} — ${g['price']}"
-        markup.add(types.InlineKeyboardButton(label, callback_data=f"{prefix}:{gid}"))
-    markup.add(build_button("◀️ ត្រឡប់ក្រោយ", "adm:menu"))
+        markup.add(build_button(label, f"{prefix}:{gid}", style="primary"))
+    markup.add(build_button("◀️ ត្រឡប់ក្រោយ", "adm:menu", style="primary"))
     return markup, found
 
 
@@ -1044,7 +1457,7 @@ def cb_removegift_pick(call):
     markup = types.InlineKeyboardMarkup()
     markup.add(
         build_button("✅ បញ្ជាក់លុប", f"adm:removegift_confirm:{gid}", style="danger"),
-        build_button("◀️ បោះបង់", "adm:menu"),
+        build_button("◀️ បោះបង់", "adm:menu", style="primary"),
     )
     bot.send_message(call.message.chat.id, f"⚠️ លុប '{gifts[gid]['name']}' មែនទេ?", reply_markup=markup)
 
@@ -1170,6 +1583,29 @@ def cmd_checkpay(msg):
     bot.send_message(msg.chat.id, f"ស្ថានភាព: {'✅ PAID' if is_paid else '⏳ មិនទាន់ទូទាត់ (UNPAID)'}")
 
 
+@bot.message_handler(commands=["errorlog"])
+def cmd_errorlog(msg):
+    """Admin-only: មើល error ថ្មីៗដែល bot បានកត់ត្រា (ដូចគ្នានឹងព័ត៌មានប្រើសម្រាប់ជូន
+    ដំណឹងស្វ័យប្រវត្តិពេល error ច្រើនហួសប្រមាណ) ដោយមិនចាំបាច់ចូល Render logs ទេ។"""
+    if not is_admin(msg.from_user.id):
+        return
+    with _error_lock:
+        now = time.time()
+        recent = [e for e in _error_events if e[0] >= now - ERROR_ALERT_WINDOW_SEC]
+    if not recent:
+        bot.send_message(
+            msg.chat.id,
+            f"✅ គ្មាន Error ណាមួយកត់ត្រាក្នុងរយៈពេល {ERROR_ALERT_WINDOW_SEC // 60} នាទីចុងក្រោយទេ។",
+        )
+        return
+    lines = [f"🔎 <b>Error {len(recent)} ក្នុងរយៈពេល {ERROR_ALERT_WINDOW_SEC // 60} នាទីចុងក្រោយ</b>", ""]
+    for ts, source, err_text in recent[-15:]:
+        t = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+        short = err_text if len(err_text) <= 150 else err_text[:150] + "…"
+        lines.append(f"• {t} [{source}] {short}")
+    bot.send_message(msg.chat.id, "\n".join(lines))
+
+
 def _global_exception_wrapper():
     while True:
         try:
@@ -1177,6 +1613,7 @@ def _global_exception_wrapper():
             bot.infinity_polling(timeout=30, long_polling_timeout=30)
         except Exception as e:
             log.error(f"Polling crashed: {e}, restarting in 5s...")
+            _record_error("polling", e)
             time.sleep(5)
 
 
